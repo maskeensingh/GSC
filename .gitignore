@@ -16,7 +16,7 @@ env/
 *.log
 
 # Model Files (Exclude or Use Git LFS)
-models/skin_disease_model.pth
+# models/skin_disease_model.pth
 
 # PDFs
 pdfs/*.pdf
