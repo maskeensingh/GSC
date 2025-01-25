@@ -1,0 +1,351 @@
+import streamlit as st
+import os
+import logging
+import json
+import PyPDF2
+from sentence_transformers import SentenceTransformer
+from langchain_groq import ChatGroq
+import faiss
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from dotenv import load_dotenv
+import tiktoken
+from transformers import pipeline
+import google.generativeai as genai
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+
+# Load environment variables
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Validate API Key
+if not GEMINI_API_KEY:
+    logging.error("Gemini API key is missing.")
+    raise ValueError("Gemini API key is missing. Please check your environment variables.")
+else:
+    logging.info("Gemini API key loaded successfully.")
+
+genai.configure(api_key=GEMINI_API_KEY)
+model_name = "gemini-1.5-flash"
+model = genai.GenerativeModel(model_name)
+
+# Define llm.invoke to use Google's Generative AI
+class GoogleLLMWrapper:
+    def invoke(self, prompt):
+        try:
+            response = model.generate_content(prompt)
+            if response and hasattr(response, "text"):  # Check if response is valid
+                return {"content": response.text}  # Return the text content
+            else:
+                logging.error("Invalid response from Gemini model.")
+                return None
+        except Exception as e:
+            logging.error(f"Error invoking Gemini model: {e}")
+            return None
+
+# Initialize llm as the wrapper
+# llm = GoogleLLMWrapper()
+llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama3-8b-8192")
+
+# Token Counting Function
+def count_tokens(text):
+    """Count the number of tokens in the input text."""
+    enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text))
+
+# Safe Summarization Function
+def safe_summarize(content, token_limit=2000):
+    """Summarize content to stay within token limits."""
+    if count_tokens(content) > token_limit:
+        summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        return summarizer(content, max_length=300, min_length=50, do_sample=False)[0]['summary_text']
+    return content
+
+# Extract Text from PDFs
+def extract_text_from_pdfs(pdf_paths):
+    text = ""
+    for pdf_path in pdf_paths:
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                for page in reader.pages:
+                    text += page.extract_text() or ""  # Handle empty text
+        except Exception as e:
+            logging.error(f"Error extracting text from {pdf_path}: {e}")
+    return text
+
+# Generate Embeddings
+def generate_embeddings(text):
+    """Generate embeddings for the text using SentenceTransformer."""
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    chunks = split_text_into_chunks(text)
+    embeddings = model.encode(chunks)
+    return chunks, embeddings
+
+# Create FAISS Index
+def create_faiss_index(embeddings):
+    if embeddings.size == 0:
+        logging.error("No embeddings provided to create FAISS index.")
+        return None
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+    return index
+
+# Split Text into Chunks
+def split_text_into_chunks(text, chunk_size=1000, chunk_overlap=200):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    chunks = splitter.split_text(text)
+    return chunks
+
+# Search for Relevant Content in PDFs
+def get_top_chunks(query, index, pdf_chunks, top_k=5):
+    """Search for the most relevant content in PDF using FAISS."""
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    query_embedding = model.encode([query])
+    D, I = index.search(query_embedding, k=top_k)
+    top_chunks = [pdf_chunks[i] for i in I[0]] if I[0].size > 0 else []
+    return top_chunks
+
+# Dynamic Prompt Builder
+def build_dynamic_prompt(context, description, num_chunks):
+    prompt=ChatPromptTemplate.from_template(
+        """
+        You are a medical expert. Analyze the following skin issue based on {num_chunks} retrieved medical references.
+        Context: {context}
+        User Description: {description}
+        Provide the top 5 possible diseases in JSON strictly JSON format:
+        [
+            {{"disease": "<Disease Name 1>", "score": <Possibility Score 1>}},
+            ...
+        ]
+        No explanation or additional text should be provided.Only send JSON output.
+        """
+    )
+    return prompt
+
+# Generate Explanations for Predictions
+def generate_explanations(predictions, retrieved_chunks):
+    explanations = {}
+    for disease in predictions:
+        explanations[disease["disease"]] = {
+            "score": disease["score"],
+            "context": retrieved_chunks
+        }
+    return explanations
+
+# Generate Diagnostic Questions
+def generate_questions_with_options(disease_list, llm, max_questions=5):
+    """
+    Generate diagnostic questions with options tailored to the predicted diseases using the LLM.
+    """
+    # Prepare input for the LLM
+    prompt = f"""
+    You are a medical expert. The following diseases are possible based on user input: {', '.join(disease_list)}.
+    Generate up to {max_questions} diagnostic multiple-choice questions to help person infected distinguish as to what disease he has among those in this list.
+    Each question should have 3-4 options, and the options chosen by patient/user should help differentiate the llm distinguish uniquely which disease patient has amongst the listed ones.
+    Provide the questions and options in the following JSON format:
+    [
+        {{
+            "question": "Question 1 text",
+            "options": ["Option A", "Option B", "Option C"],
+            "answer": "Option A"
+        }},
+        ...
+    ]
+    IMPORTANT:
+    - Do not include any explanations, additional text, or notes.
+    - Return only the JSON output.
+    - Ensure the output is valid JSON and can be parsed by a JSON parser.
+    """
+    # Use the LLM to generate questions
+    response = llm.invoke(prompt)
+    questions_json = response.content.strip()
+    logging.info(f"Questions JSON: {questions_json}")
+    try:
+        # Search for JSON content within the response
+        import re
+        json_match = re.search(r'\[\s*{.*}\s*\]', questions_json, re.DOTALL)
+        if json_match:
+            questions_json = json_match.group()
+            questions = json.loads(questions_json)
+            if not isinstance(questions, list):
+                raise ValueError("Expected a list of questions.")
+        else:
+            raise ValueError("No JSON content found in response.")
+    except (json.JSONDecodeError, ValueError) as e:
+        logging.error(f"Failed to parse questions JSON: {e}")
+        questions = []
+    return questions[:max_questions]
+
+
+# Refine Disease Prediction
+import json
+
+
+def refine_disease_prediction(disease_list, user_answers, llm):
+    prompt = f"""
+    You are a medical expert. Based on the user's symptoms, the following diseases were predicted: {', '.join(disease_list)}.
+    The user has answered diagnostic questions as follows:
+    {json.dumps(user_answers, indent=2)}
+    Use this information to refine the predictions and provide the most likely disease.
+    Output the final disease in this JSON format:
+    {{
+        "disease": "<Final Disease>",
+        "justification": "<Reason based on answers>"
+    }}
+    No explanation or additional text should be provided.
+    """
+    response = llm.invoke(prompt)
+    refined_disease_str = response.content.strip() if response else None
+    logging.info(f"Response from LLM: {refined_disease_str}")
+    try:
+        json_match = re.search(r'\{\s*".*"\s*:\s*".*"\s*,\s*".*"\s*:\s*".*"\s*\}', refined_disease_str, re.DOTALL)
+        if json_match:
+            refined_disease_str = json_match.group()
+            refined_disease = json.loads(refined_disease_str)
+        else:
+            raise ValueError("No JSON content found in response.")
+    except Exception as e:
+        logging.error(f"Failed to parse JSON response: {e}")
+        refined_disease = {"disease": "Unknown", "justification": "Unable to parse response."}
+    return refined_disease
+
+
+# Streamlit Interface
+st.title(" Skin Disease Diagnosis Assistant")
+st.markdown("""
+    🧬 **Diagnose Skin Diseases**: Upload an image, provide a description of the skin problem, and receive guidance on possible diseases along with diagnostic questions for refinement.
+""")
+
+# User Inputs
+uploaded_image = st.file_uploader("Upload an image of the skin issue (optional):", type=["jpg", "jpeg", "png"])
+user_description = st.text_area("Describe your skin problem (e.g., 'Red rash with itchiness for 3 days'):")
+if not user_description or len(user_description.strip()) < 5:
+    st.error("Please provide a detailed description of your skin problem.")
+    st.stop()  # Stop further processing if input is invalid
+# Process Input
+if user_description:
+    try:
+        # Extract and Process PDF Data
+        pdf_paths = ["skin_diseases_guide1.pdf", "skin_diseases_guide2.pdf"]
+        
+        def clean_pdf_text(text):
+            """Remove irrelevant sections like acknowledgments, prefaces, and exam questions."""
+            filtered_text = []
+            for line in text.split("\n"):
+                if any(keyword in line for keyword in ["ACKNOWLEDGEMENT", "PREFACE", "Table", "exam"]):
+                    continue
+                filtered_text.append(line.strip())
+            return " ".join(filtered_text)
+
+        pdf_text = extract_text_from_pdfs(pdf_paths)
+        logging.info("PDF text extracted successfully.\n")
+        pdf_text = clean_pdf_text(pdf_text)
+        logging.info("PDF text cleaned successfully.\n")
+        pdf_chunks, pdf_embeddings = generate_embeddings(pdf_text)
+        logging.info("Embeddings generated successfully.\n")
+        pdf_index = create_faiss_index(pdf_embeddings)
+        logging.info("FAISS index created successfully.\n")
+
+
+        if not pdf_index:
+            st.error("Failed to create FAISS index. Ensure embeddings were generated correctly.")
+            st.stop()
+
+        # Search Relevant Content
+        pdf_search_results = get_top_chunks(user_description, pdf_index, pdf_chunks, top_k=3)
+        context = safe_summarize(" ".join(pdf_search_results), token_limit=3000)
+
+        # Calculate the number of chunks used in the context
+        num_chunks = min(len(pdf_search_results), 5)
+
+        # Build and Query Prompt
+        prompt = build_dynamic_prompt(context, user_description, num_chunks)
+        query_context = {"context": context, "description": user_description, "num_chunks": num_chunks}  # Include num_chunks
+        formatted_prompt = prompt.format_prompt(**query_context).to_string()  ###query_context
+        logging.info(f"\n Final Prompt for LLM:\n{formatted_prompt}")
+
+
+        
+        response = llm.invoke(formatted_prompt)
+        if not response or not hasattr(response, "content") or not response.content.strip():
+           logging.error("Invalid or empty response from LLM.")
+           st.error("Unable to process diagnosis. Please try again.")
+           
+
+        raw_response = response.content.strip()
+        logging.info(f"Raw LLM response \n : {raw_response}. \n")
+
+        # diseases_with_scores_str = getattr(response, "content", "[]")
+        # logging.info(f"Diseases with scores: {diseases_with_scores_str}")
+
+        # Parse and handle diseases_with_scores
+        diseases_with_scores = []
+        try:
+            diseases_with_scores_str = getattr(response, "content", "[]")
+            logging.info(f"LLM RETURNED Diseases with scores: {diseases_with_scores_str}")
+            import re
+            json_match = re.search(r'\[\s*{.*}\s*\]', diseases_with_scores_str, flags=re.DOTALL)
+            if json_match:
+                diseases_with_scores_str = json_match.group()
+                diseases_with_scores = json.loads(diseases_with_scores_str)  # Parse JSON into a list
+            else:
+                raise ValueError("No JSON content found in response.")
+                                   
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.error(f"Failed to parse JSON response: {e}")
+            diseases_with_scores_str = {"disease": "Unknown", "justification": "Unable to parse response."}
+            diseases_with_scores = []
+
+        # Extract disease names
+        disease_names = [d.get("disease", "Unknown") for d in diseases_with_scores if isinstance(d, dict)]
+
+       
+        if diseases_with_scores:
+            st.markdown("### Possible Diseases with Scores:")
+            st.json(diseases_with_scores)
+
+            # Generate Diagnostic Questions
+            disease_list = [disease["disease"] for disease in diseases_with_scores]
+            diagnostic_questions = generate_questions_with_options(disease_list, llm, max_questions=5)
+
+            # Streamlit Interface for answering diagnostic questions
+            if diagnostic_questions:
+                st.markdown("### Diagnostic Questions:")
+                
+                # Initialize the session state to store answers if not already initialized
+                if "user_answers" not in st.session_state:
+                    st.session_state.user_answers = {}
+
+                # Show each diagnostic question, updating session state
+                for question in diagnostic_questions:
+                    if question["question"] not in st.session_state.user_answers:
+                        st.session_state.user_answers[question["question"]] = st.selectbox(
+                            question["question"],
+                            question["options"]
+                        )
+
+                # Check if all questions have been answered
+                all_answered = all(q["question"] in st.session_state.user_answers for q in diagnostic_questions)
+
+                # Display the "Refine Diagnosis" button only after all questions are answered
+                if all_answered:
+                    if st.button("Refine Diagnosis"):
+                        # All questions are answered, so now we can refine the disease prediction
+                        refined_prediction = refine_disease_prediction(disease_list, st.session_state.user_answers, llm)
+                        st.markdown("### Final Disease Prediction:")
+                        st.json(refined_prediction)
+                else:
+                    st.warning("Please answer all the diagnostic questions before refining the diagnosis.")
+
+
+        else:
+            st.warning("No diseases were identified. Please try again with more detailed input.")
+
+    except Exception as e:  
+        logging.error(f"Error during diagnosis: {e}")
+        st.error("An error occurred. Please try again.")

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Final Diagnosis</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+    <h1>Final Disease Prediction</h1>
+    <p><strong>Disease:</strong> {{ refined_prediction.disease }}</p>
+    <p><strong>Justification:</strong> {{ refined_prediction.justification }}</p>
+
+    {% if remedies %}
+        <h2>Recommendations</h2>
+        <ul>
+            <li><strong>Description:</strong> {{ remedies.answer.description }}</li>
+            <li><strong>Immediate Actions:</strong>
+                <ul>
+                    {% for action in remedies.answer.immediate_actions %}
+                        <li>{{ action }}</li>
+                    {% endfor %}
+                </ul>
+            </li>
+            <li><strong>Home Remedies:</strong>
+                <ul>
+                    {% for remedy in remedies.answer.home_remedies %}
+                        <li>{{ remedy }}</li>
+                    {% endfor %}
+                </ul>
+            </li>
+            <li><strong>Preventive Measures:</strong>
+                <ul>
+                    {% for measure in remedies.answer.preventive_measures %}
+                        <li>{{ measure }}</li>
+                    {% endfor %}
+                </ul>
+            </li>
+            <li><strong>Medications:</strong>
+                <ul>
+                    {% for med in remedies.answer.medications %}
+                        <li>{{ med }}</li>
+                    {% endfor %}
+                </ul>
+            </li>
+            <li><strong>Dos and Don'ts:</strong>
+                <ul>
+                    {% for item in remedies.answer.dos_and_donts %}
+                        <li>{{ item }}</li>
+                    {% endfor %}
+                </ul>
+            </li>
+        </ul>
+    {% endif %}
+
+    {% if nearby_places_pharmacy or nearby_places_skin_specialist %}
+        <h2>Nearby Services</h2>
+
+        {% if nearby_places_pharmacy %}
+            <h3>Nearby Pharmacies:</h3>
+            <ul>
+                {% for place in nearby_places_pharmacy %}
+                    <li><strong>{{ place.name }}</strong> - {{ place.address }} ({{ place.rating }}⭐)</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+
+        {% if nearby_places_skin_specialist %}
+            <h3>Nearby Skin Specialists:</h3>
+            <ul>
+                {% for place in nearby_places_skin_specialist %}
+                    <li><strong>{{ place.name }}</strong> - {{ place.address }} ({{ place.rating }}⭐)</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+
+        <h3>Map of Nearby Services:</h3>
+        <div>
+            {{ map_html|safe }}
+        </div>
+    {% endif %}
+</body>
+</html>

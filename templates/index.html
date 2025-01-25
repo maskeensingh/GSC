@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Skin Disease Diagnosis Assistant</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+    <h1>Skin Disease Diagnosis Assistant</h1>
+    <p>🧬 <strong>Diagnose Skin Diseases</strong>: Upload an image, provide a description of the skin problem, and receive guidance on possible diseases along with diagnostic questions for refinement.</p>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="POST" enctype="multipart/form-data">
+        <label for="image">Upload an image of the skin issue (optional):</label><br>
+        <input type="file" name="image" accept="image/*"><br><br>
+
+        <label for="description">Describe your skin problem (e.g., 'Red rash with itchiness for 3 days'):</label><br>
+        <textarea name="description" rows="4" cols="50" required></textarea><br><br>
+
+        <label for="location">Enter your location (e.g., 'New Delhi, India'):</label><br>
+        <input type="text" name="location"><br><br>
+
+        <button type="submit">Diagnose</button>
+    </form>
+</body>
+</html>

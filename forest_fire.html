@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forest Fire Prediction</title>
+</head>
+<body>
+    <h1>Forest Fire Prediction</h1>
+    <form action="/predict" method="post" enctype="multipart/form-data">
+        <label for="file">Upload an Image:</label>
+        <input type="file" name="file" id="file" accept="image/*" required>
+        <button type="submit">Predict</button>
+    </form>
+    <h2>{{ pred }}</h2>
+    <p>{{ bhai }}</p>
+</body>
+</html>

@@ -1,0 +1,1 @@
+in main.py also add user given symptoms and disease name and also user answered question answers(or generate qs) to better judge severity

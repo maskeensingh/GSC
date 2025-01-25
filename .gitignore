@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+venv/
+env/
+.venv/
+.env
+
+# IDEs and Editors
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Model Files (Exclude or Use Git LFS)
+models/skin_disease_model.pth
+
+# PDFs
+pdfs/*.pdf
+
+# Others
+*.DS_Store
+

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Diagnosis Results</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+    <h1>Possible Diseases</h1>
+    <ul>
+        {% for disease in diseases %}
+            <li>{{ disease.disease }}{% if disease.score %} - Score: {{ disease.score }}{% endif %}</li>
+        {% endfor %}
+    </ul>
+
+    <h2>Diagnostic Questions</h2>
+    <form method="POST">
+        {% for question in questions %}
+            <div class="question">
+                <p>{{ question.question }}</p>
+                {% for option in question.options %}
+                    <input type="radio" name="question_{{ loop.index }}" value="{{ option }}" required> {{ option }}<br>
+                {% endfor %}
+            </div>
+            <br>
+        {% endfor %}
+        <button type="submit">Submit Answers</button>
+    </form>
+</body>
+</html>

@@ -1,0 +1,539 @@
+import streamlit as st
+import os
+import logging
+import json
+import PyPDF2
+from sentence_transformers import SentenceTransformer
+from langchain_groq import ChatGroq
+import faiss
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from dotenv import load_dotenv
+import tiktoken
+from geopy.geocoders import Nominatim
+import googlemaps
+from streamlit_folium import st_folium
+import folium
+from transformers import pipeline
+import google.generativeai as genai
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+
+# Load environment variables
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Validate API Keys
+if not GROQ_API_KEY or not GOOGLE_PLACES_API_KEY:
+    raise ValueError("API keys for Groq and/or Google Places are missing. Check your environment variables.")
+
+# Initialize APIs
+llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama3-8b-8192")
+gmaps = googlemaps.Client(key=GOOGLE_PLACES_API_KEY)
+
+genai.configure(api_key=GEMINI_API_KEY)
+model_name = "gemini-1.5-flash"
+model = genai.GenerativeModel(model_name)
+
+# Define llm.invoke to use Google's Generative AI
+class GoogleLLMWrapper:
+    def invoke(self, prompt):
+        try:
+            response = model.generate_content(prompt)
+            if response and hasattr(response, "text"):  # Check if response is valid
+                return {"content": response.text}  # Return the text content
+            else:
+                logging.error("Invalid response from Gemini model.")
+                return None
+        except Exception as e:
+            logging.error(f"Error invoking Gemini model: {e}")
+            return None
+        
+
+llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama3-8b-8192")
+gmaps = googlemaps.Client(key=GOOGLE_PLACES_API_KEY)
+
+def count_tokens(text):
+    """Count the number of tokens in the input text."""
+    enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text))
+
+# Safe Summarization Function
+def safe_summarize(content, token_limit=2000):
+    """Summarize content to stay within token limits."""
+    if count_tokens(content) > token_limit:
+        summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        return summarizer(content, max_length=300, min_length=50, do_sample=False)[0]['summary_text']
+    return content
+
+# Extract Text from PDFs
+def extract_text_from_pdfs(pdf_paths):
+    text = ""
+    for pdf_path in pdf_paths:
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                for page in reader.pages:
+                    text += page.extract_text() or ""  # Handle empty text
+        except Exception as e:
+            logging.error(f"Error extracting text from {pdf_path}: {e}")
+    return text
+
+# Generate Embeddings
+def generate_embeddings(text):
+    """Generate embeddings for the text using SentenceTransformer."""
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    chunks = split_text_into_chunks(text)
+    embeddings = model.encode(chunks)
+    return chunks, embeddings
+
+# Create FAISS Index
+def create_faiss_index(embeddings):
+    if embeddings.size == 0:
+        logging.error("No embeddings provided to create FAISS index.")
+        return None
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+    return index
+
+# Split Text into Chunks
+def split_text_into_chunks(text, chunk_size=1000, chunk_overlap=200):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    chunks = splitter.split_text(text)
+    return chunks
+
+# Search for Relevant Content in PDFs
+def get_top_chunks(query, index, pdf_chunks, top_k=5):
+    """Search for the most relevant content in PDF using FAISS."""
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    query_embedding = model.encode([query])
+    D, I = index.search(query_embedding, k=top_k)
+    top_chunks = [pdf_chunks[i] for i in I[0]] if I[0].size > 0 else []
+    return top_chunks
+
+# Dynamic Prompt Builder
+def build_dynamic_prompt(context, description, num_chunks):
+    prompt=ChatPromptTemplate.from_template(
+        """
+        You are a medical expert. Analyze the following skin issue based on {num_chunks} retrieved medical references.
+        Context: {context}
+        User Description: {description}
+        Provide the top 5 possible diseases in JSON strictly JSON format:
+        [
+            {{"disease": "<Disease Name 1>", "score": <Possibility Score 1>}},
+            ...
+        ]
+        No explanation or additional text should be provided.Only send JSON output.
+        """
+    )
+    return prompt
+
+# Generate Explanations for Predictions
+def generate_explanations(predictions, retrieved_chunks):
+    explanations = {}
+    for disease in predictions:
+        explanations[disease["disease"]] = {
+            "score": disease["score"],
+            "context": retrieved_chunks
+        }
+    return explanations
+
+# Generate Diagnostic Questions
+def generate_questions_with_options(disease_list, llm, max_questions=5):
+    """
+    Generate diagnostic questions with options tailored to the predicted diseases using the LLM.
+    """
+    # Prepare input for the LLM
+    prompt = f"""
+    You are a medical expert. The following diseases are possible based on user input: {', '.join(disease_list)}.
+    Generate up to {max_questions} diagnostic multiple-choice questions to help person infected distinguish as to what disease he has among those in this list.
+    Each question should have 3-4 options, and the options chosen by patient/user should help differentiate the llm distinguish uniquely which disease patient has amongst the listed ones.
+    Provide the questions and options in the following JSON format:
+    [
+        {{
+            "question": "Question 1 text",
+            "options": ["Option A", "Option B", "Option C"],
+            "answer": "Option A"
+        }},
+        ...
+    ]
+    IMPORTANT:
+    - Do not include any explanations, additional text, or notes.
+    - Return only the JSON output.
+    - Ensure the output is valid JSON and can be parsed by a JSON parser.
+    """
+    # Use the LLM to generate questions
+    response = llm.invoke(prompt)
+    questions_json = response.content.strip()
+    logging.info(f"Questions JSON: {questions_json}")
+    try:
+        # Search for JSON content within the response
+        import re
+        json_match = re.search(r'\[\s*{.*}\s*\]', questions_json, re.DOTALL)
+        if json_match:
+            questions_json = json_match.group()
+            questions = json.loads(questions_json)
+            if not isinstance(questions, list):
+                raise ValueError("Expected a list of questions.")
+        else:
+            raise ValueError("No JSON content found in response.")
+    except (json.JSONDecodeError, ValueError) as e:
+        logging.error(f"Failed to parse questions JSON: {e}")
+        questions = []
+    return questions[:max_questions]
+
+
+# Refine Disease Prediction
+import json
+
+
+def refine_disease_prediction(disease_list, user_answers, llm):
+    prompt = f"""
+    You are a medical expert. Based on the user's symptoms, the following diseases were predicted: {', '.join(disease_list)}.
+    The user has answered diagnostic questions as follows:
+    {json.dumps(user_answers, indent=2)}
+    Use this information to refine the predictions and provide the most likely disease.
+    Output the final disease in this JSON format:
+    {{
+        "disease": "<Final Disease>",
+        "justification": "<Reason based on answers>"
+    }}
+    No explanation or additional text should be provided.
+    """
+    response = llm.invoke(prompt)
+    refined_disease_str = response.content.strip() if response else None
+    logging.info(f"Response from LLM: {refined_disease_str}")
+    try:
+        json_match = re.search(r'\{\s*".*"\s*:\s*".*"\s*,\s*".*"\s*:\s*".*"\s*\}', refined_disease_str, re.DOTALL)
+        if json_match:
+            refined_disease_str = json_match.group()
+            refined_disease = json.loads(refined_disease_str)
+        else:
+            raise ValueError("No JSON content found in response.")
+    except Exception as e:
+        logging.error(f"Failed to parse JSON response: {e}")
+        refined_disease = {"disease": "Unknown", "justification": "Unable to parse response."}
+    return refined_disease
+
+def fetch_nearby_places(place_type, user_coordinates, radius=2000):
+    try:
+        results = gmaps.places_nearby(location=user_coordinates, radius=radius, type=place_type).get("results", [])
+        
+        # Filter results based on keywords for skin specialists
+        if place_type == "skin specialist":
+            keywords = ["dermatologist", "skin", "clinic","hospital"]
+            results = [
+                place for place in results
+                if any(keyword.lower() in place.get("name", "").lower() for keyword in keywords)
+            ]
+        
+        return [
+            {
+                "name": place.get("name", "Unknown"),
+                "address": place.get("vicinity", "Address not available"),
+                "rating": place.get("rating", "No rating available"),
+                "location": (
+                    place.get("geometry", {}).get("location", {}).get("lat"),
+                    place.get("geometry", {}).get("location", {}).get("lng")
+                ),
+            }
+            for place in results
+        ][:5]
+    except Exception as e:
+        logging.error(f"Google Places API Error: {e}")
+        return []
+
+
+def display_map(places, user_coordinates):
+    m = folium.Map(location=user_coordinates, zoom_start=15)
+    folium.Marker(
+        location=user_coordinates, popup="Your Location", icon=folium.Icon(color="blue")
+    ).add_to(m)
+    for place in places:
+        folium.Marker(
+            location=place["location"],
+            popup=f"{place['name']} - {place.get('rating', 'No rating')}\u2b50",
+            icon=folium.Icon(color="green")
+        ).add_to(m)
+    st_folium(m, width=700, height=500)
+
+def actions_prompt(context, disease_name, severity):
+    # Define the prompt template with dynamic placeholders
+    prompt = ChatPromptTemplate.from_template(
+        """
+        You are a medical expert specializing in providing actionable advice to empower individuals, especially those with limited resources, to make informed decisions about their health. 
+
+        Disease: {disease_name}
+        Severity: {severity}
+        
+        Instructions:
+        1. If the severity is **severe**, explain why the condition is critical, emphasize the urgency of consulting a doctor or specialist, and provide immediate actions or precautions to prevent worsening.
+        2. If the severity is **moderate**, suggest affordable over-the-counter medications (ointments, creams, tablets, etc.), simple home remedies, and actions to manage symptoms effectively.
+        3. Always include:
+            - A list of common and affordable home remedies.
+            - Low-cost, accessible medicines, if applicable.
+            - Preventive measures to avoid further complications.
+            - Necessary actions, dos and don’ts, and recovery tips.
+
+        Context: {context}
+
+        Output the response strictly in the following JSON format:
+        ```json
+        {{
+            "severity": "{severity}",
+            "answer": {{
+                "description": "<Brief explanation of the condition>",
+                "immediate_actions": [
+                    "List of actions to take immediately for relief and to prevent worsening."
+                ],
+                "home_remedies": [
+                    "Affordable, accessible remedies for symptom relief."
+                ],
+                "preventive_measures": [
+                    "Steps to prevent the condition from worsening."
+                ],
+                "medications": [
+                    "Over-the-counter medications available at most pharmacies."
+                ],
+                "dos_and_donts": [
+                    "Helpful actions to take.",
+                    "Actions to avoid for recovery."
+                ]
+            }}
+        }}
+        ```
+
+        Example Output:
+        ```json
+        {{
+            "severity": "severe",
+            "answer": {{
+                "description": "Severe eczema can lead to significant discomfort, sleep disturbance, and impact daily activities. It is essential to seek medical attention from a dermatologist or healthcare provider.",
+                "immediate_actions": [
+                    "Apply a topical corticosteroid or immunomodulator cream.",
+                    "Use cool compresses or wet wraps.",
+                    "Avoid scratching to prevent further irritation."
+                ],
+                "home_remedies": [
+                    "Oatmeal baths for soothing.",
+                    "Coconut oil to moisturize and calm the skin."
+                ],
+                "preventive_measures": [
+                    "Identify and avoid allergens or irritants.",
+                    "Keep skin moisturized with fragrance-free products."
+                ],
+                "medications": [
+                    "Hydrocortisone cream for inflammation.",
+                    "Diphenhydramine for itching relief."
+                ],
+                "dos_and_donts": [
+                    "Do: Keep the skin hydrated.",
+                    "Don’t: Use harsh soaps or detergents."
+                ]
+            }}
+        }}
+        ```
+
+        Ensure the JSON response is well-formed and adheres strictly to the provided structure. Do not include any extra text outside the JSON object.
+        """
+    )
+
+
+
+    # Format the prompt with the provided context, disease name, and severity
+    formatted_prompt = prompt.format_prompt(context=context, disease_name=disease_name, severity=severity).to_string()
+
+    return formatted_prompt
+
+
+
+# Streamlit Interface
+st.title(" Skin Disease Diagnosis Assistant")
+st.markdown("""
+    🧬 **Diagnose Skin Diseases**: Upload an image, provide a description of the skin problem, and receive guidance on possible diseases along with diagnostic questions for refinement.
+""")
+
+# User Inputs
+uploaded_image = st.file_uploader("Upload an image of the skin issue (optional):", type=["jpg", "jpeg", "png"])
+user_description = st.text_area("Describe your skin problem (e.g., 'Red rash with itchiness for 3 days'):")
+location_input = st.text_input("Enter your location (e.g., 'New Delhi, India'):").strip()
+
+# Early validation of description input
+if not user_description or len(user_description.strip()) < 5:
+    st.error("Please provide a detailed description of your skin problem.")
+    st.stop()  # Stop further processing if input is invalid
+
+disease_name = ""
+
+try:
+    # Extract and Process PDF Data
+    pdf_paths = ["skin_diseases_guide1.pdf", "skin_diseases_guide2.pdf"]
+
+    def clean_pdf_text(text):
+        """Remove irrelevant sections like acknowledgments, prefaces, and exam questions."""
+        filtered_text = [line.strip() for line in text.split("\n") if not any(keyword in line for keyword in ["ACKNOWLEDGEMENT", "PREFACE", "Table", "exam"])]
+        return " ".join(filtered_text)
+
+    # Extract text from PDFs
+    pdf_text = extract_text_from_pdfs(pdf_paths)
+    if not pdf_text:
+        st.error("Failed to extract text from provided PDF files.")
+        st.stop()
+
+    logging.info("PDF text extracted successfully.")
+    pdf_text = clean_pdf_text(pdf_text)
+    logging.info("PDF text cleaned successfully.")
+    
+    # Generate embeddings and create index
+    pdf_chunks, pdf_embeddings = generate_embeddings(pdf_text)
+    logging.info("Embeddings generated successfully.")
+    pdf_index = create_faiss_index(pdf_embeddings)
+    
+    if not pdf_index:
+        st.error("Failed to create FAISS index. Ensure embeddings were generated correctly.")
+        st.stop()
+
+    logging.info("FAISS index created successfully.")
+
+    # Search for relevant content based on user description
+    pdf_search_results = get_top_chunks(user_description, pdf_index, pdf_chunks, top_k=3)
+    context = safe_summarize(" ".join(pdf_search_results), token_limit=3000)
+
+    num_chunks = min(len(pdf_search_results), 5)
+    prompt = build_dynamic_prompt(context, user_description, num_chunks)
+    query_context = {"context": context, "description": user_description, "num_chunks": num_chunks}
+    formatted_prompt = prompt.format_prompt(**query_context).to_string()
+
+    logging.info(f"Final prompt for LLM:\n{formatted_prompt}")
+    response = llm.invoke(formatted_prompt)
+
+    if not response or not hasattr(response, "content") or not response.content.strip():
+        st.error("Unable to process diagnosis. Please try again.")
+        st.stop()
+
+    raw_response = response.content.strip()
+    logging.info(f"Raw LLM response: {raw_response}")
+
+    # Parsing the response
+    try:
+        diseases_with_scores = json.loads(raw_response)
+        logging.info(f"LLM returned diseases with scores: {diseases_with_scores}")
+    except json.JSONDecodeError:
+        logging.error("Failed to parse JSON response.")
+        st.error("Unable to process the diseases with scores. Please try again.")
+        st.stop()
+
+    if diseases_with_scores:
+        st.markdown("### Possible Diseases with Scores:")
+        st.json(diseases_with_scores)
+
+        # Generate diagnostic questions
+        disease_list = [disease["disease"] for disease in diseases_with_scores]
+        diagnostic_questions = generate_questions_with_options(disease_list, llm, max_questions=5)
+
+        if diagnostic_questions:
+            st.markdown("### Diagnostic Questions:")
+
+            # Initialize session state for user answers if not already present
+            if "user_answers" not in st.session_state:
+                st.session_state.user_answers = {}
+
+            for question in diagnostic_questions:
+                if question["question"] not in st.session_state.user_answers:
+                    st.session_state.user_answers[question["question"]] = st.selectbox(
+                        question["question"],
+                        question["options"]
+                    )
+
+            if st.button("Submit"):
+                st.success("Answers submitted successfully!")
+                refined_prediction = refine_disease_prediction(disease_list, st.session_state.user_answers, llm)
+                st.markdown("### Final Disease Prediction:")
+                st.json(refined_prediction)
+
+                if isinstance(refined_prediction, dict) and "disease" in refined_prediction:
+                    disease_name = refined_prediction["disease"]
+                    st.info(f"Stored final disease: {disease_name}")
+                else:
+                    st.warning("Could not extract a valid disease name from the refined prediction.")
+                    disease_name = ""
+        else:
+            st.warning("No diagnostic questions generated. Please try again with more detailed input.")
+    else:
+        st.warning("No diseases were identified. Please try again with more detailed input.")
+except Exception as e:
+    logging.error(f"Error occurred: {e}")
+    st.error(f"An error occurred while processing your request: {e}")
+    st.stop()
+
+# Additional handling for disease remedies and location if disease_name is found
+if disease_name:
+    try:
+        # Fetch remedies related to the disease
+        pdf_paths = ["remedies1.pdf", "remedies2.pdf"]
+        pdf_text = clean_pdf_text(extract_text_from_pdfs(pdf_paths))
+        pdf_chunks, pdf_embeddings = generate_embeddings(pdf_text)
+        pdf_index = create_faiss_index(pdf_embeddings)
+
+        # Query the PDF for remedies based on the disease name
+        context = " ".join(get_top_chunks(disease_name, pdf_index, pdf_chunks))
+
+        # Severity assessment
+        severity_prompt = f"""
+        Classify the disease {disease_name} in terms of its effects as one of the following: mild, moderate, or severe. 
+        Only return one string as output: "mild", "moderate", or "severe". 
+        Do not provide any explanations or additional text.
+        """
+        severity = llm.invoke(severity_prompt).content.strip().lower()
+        if severity not in ["mild", "moderate", "severe"]:
+            raise ValueError(f"Invalid severity level returned: {severity}")
+        logging.info(f"Severity assessment: {severity}")
+
+        # Generate remedies
+        prompt = actions_prompt(context, disease_name, severity)
+        response = llm.invoke(prompt)
+        remedies = json.loads(response.content.strip()) if response else None
+
+        if remedies:
+            st.subheader("Answer:")
+            st.json(remedies)
+        else:
+            st.warning("No remedies available at this time.")
+    except Exception as e:
+        logging.error(f"Error occurred: {e}")
+        st.error(f"An error occurred while processing remedies: {e}")
+
+# Handling user location and nearby services
+if location_input:
+    try:
+        geolocator = Nominatim(user_agent="skingenie")
+        user_location = geolocator.geocode(location_input)
+        
+        if user_location:
+            user_coordinates = (user_location.latitude, user_location.longitude)
+            nearby_places_pharmacy = fetch_nearby_places("pharmacy", user_coordinates)
+            nearby_places_skin_specialist = fetch_nearby_places("skin specialist", user_coordinates)
+
+            if nearby_places_pharmacy:
+                st.subheader("Nearby Pharmacies:")
+                for place in nearby_places_pharmacy:
+                    st.write(f"**{place['name']}** - {place['address']} ({place['rating']}⭐)")
+
+            if nearby_places_skin_specialist:
+                st.subheader("Nearby Skin Specialists:")
+                for place in nearby_places_skin_specialist:
+                    st.write(f"**{place['name']}** - {place['address']} ({place['rating']}⭐)")
+
+            if nearby_places_pharmacy or nearby_places_skin_specialist:
+                display_map(nearby_places_pharmacy + nearby_places_skin_specialist, user_coordinates)
+            else:
+                st.warning("No nearby locations found.")
+        else:
+            st.error("Invalid location. Please try entering a different location.")
+    except Exception as e:
+        logging.error(f"Error occurred: {e}")
+        st.error(f"An error occurred while processing the location: {e}")

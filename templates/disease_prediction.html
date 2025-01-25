@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Skin Disease Prediction</title>
+</head>
+<body>
+    <h1>Skin Disease Prediction</h1>
+    <form action="/predict" method="POST" enctype="multipart/form-data">
+        <label for="file">Upload your image:</label>
+        <input type="file" name="file" id="file" required>
+        <button type="submit">Predict</button>
+    </form>
+
+    {% if prediction %}
+        <h2>Prediction Result:</h2>
+        <p><strong>Predicted Disease:</strong> {{ prediction }}</p>
+        <img src="{{ image_path }}" alt="Uploaded Image" style="width: 300px;">
+    {% endif %}
+</body>
+</html>
